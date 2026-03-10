@@ -16,7 +16,6 @@ const startTime = Date.now();
 
 app.use(express.json());
 
-// ── Gateway info ───────────────────────────────────────────────────────────────
 app.get("/", (req, res) => {
   res.json({
     message: "Gateway is running",
@@ -33,7 +32,6 @@ app.get("/", (req, res) => {
   });
 });
 
-// ── Gateway health ─────────────────────────────────────────────────────────────
 app.get("/gateway/health", async (req, res) => {
   const uptimeSeconds = Math.floor((Date.now() - startTime) / 1000);
 
@@ -57,7 +55,6 @@ app.get("/gateway/health", async (req, res) => {
   });
 });
 
-// ── Admin: configured rate limit rules ────────────────────────────────────────
 app.get("/admin/rate-limit-rules", (req, res) => {
   res.json({
     description: "All active rate limiting policies for this gateway",
@@ -84,23 +81,19 @@ app.get("/admin/rate-limit-rules", (req, res) => {
   });
 });
 
-// ── Admin: live gateway stats ──────────────────────────────────────────────────
 app.get("/admin/gateway-stats", (req, res) => {
   res.json(getStats());
 });
 
-// ── Redis connectivity test ────────────────────────────────────────────────────
 app.get("/gateway/redis-test", async (req, res) => {
   await redis.set("gateway:test", "redis is working", "EX", 60);
   const value = await redis.get("gateway:test");
   res.json({ message: "Redis test successful", value });
 });
 
-// ── All other routes: rate limit → proxy to backend ───────────────────────────
 app.use(rateLimiter);
 app.all("/{*path}", forwardRequest);
 
-// ── Centralized error handler (must be last) ───────────────────────────────────
 app.use(errorHandler);
 
 app.listen(PORT, () => {
