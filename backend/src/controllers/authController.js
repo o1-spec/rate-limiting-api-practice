@@ -52,7 +52,6 @@ export const register = (req, res) => {
     createdAt: new Date().toISOString(),
   };
 
-  // Persist to in-memory arrays so subsequent requests can see the new user
   registeredAccounts.push(newAccount);
   users.push(newUser);
 
