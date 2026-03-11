@@ -1,4 +1,5 @@
 import express from "express";
+import cors from "cors";
 import dotenv from "dotenv";
 import { redis } from "./redis/client.js";
 import { rateLimiter } from "./middleware/rateLimiter.js";
@@ -14,6 +15,15 @@ const PORT = process.env.PORT || 4000;
 const BACKEND_URL = process.env.BACKEND_URL || "http://localhost:5001";
 const startTime = Date.now();
 
+app.use(cors({
+  origin: "http://localhost:3000",
+  exposedHeaders: [
+    "X-RateLimit-Limit",
+    "X-RateLimit-Remaining",
+    "X-RateLimit-Reset",
+    "Retry-After",
+  ],
+}));
 app.use(express.json());
 
 app.get("/", (req, res) => {
