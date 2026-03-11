@@ -1,4 +1,5 @@
 import express from "express";
+import cors from "cors";
 import dotenv from "dotenv";
 import { redis } from "./redis/client.js";
 import { rateLimiter } from "./middleware/rateLimiter.js";
@@ -14,6 +15,15 @@ const PORT = process.env.PORT || 4000;
 const BACKEND_URL = process.env.BACKEND_URL || "http://localhost:5001";
 const startTime = Date.now();
 
+app.use(cors({
+  origin: "http://localhost:3000",
+  exposedHeaders: [
+    "X-RateLimit-Limit",
+    "X-RateLimit-Remaining",
+    "X-RateLimit-Reset",
+    "Retry-After",
+  ],
+}));
 app.use(express.json());
 
 app.get("/", (req, res) => {
@@ -62,21 +72,29 @@ app.get("/admin/rate-limit-rules", (req, res) => {
       description: "Applied to every request regardless of route",
       windowMs: limits.globalIp.windowMs,
       max: limits.globalIp.max,
+      algorithm: limits.globalIp.algorithm ?? "fixedWindow",
       windowLabel: "60s",
     },
     globalUser: {
       description: "Applied to authenticated requests (x-user-id header present)",
       windowMs: limits.globalUser.windowMs,
       max: limits.globalUser.max,
+      algorithm: limits.globalUser.algorithm ?? "fixedWindow",
       windowLabel: "60s",
     },
-    routes: Object.entries(limits.routes).map(([key, policy]) => ({
-      routeKey: key,
-      windowMs: policy.windowMs,
-      max: policy.max,
-      scope: policy.scope,
-      windowLabel: "60s",
-    })),
+    routes: Object.fromEntries(
+      Object.entries(limits.routes).map(([key, policy]) => [
+        key,
+        {
+          windowMs: policy.windowMs,
+          max: policy.max,
+          scope: policy.scope,
+          algorithm: policy.algorithm ?? "fixedWindow",
+          capacity: policy.capacity,
+          windowLabel: "60s",
+        },
+      ])
+    ),
     redisFailureMode: process.env.REDIS_FAILURE_MODE || "open",
   });
 });

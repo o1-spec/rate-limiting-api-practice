@@ -19,6 +19,24 @@ let mockCounter = 0;
 let mockTtl = 30000;
 let mockRedisDown = false;
 
+// Build a fresh pipeline mock that resolves to "allowed with 1 request in window"
+function makePipelineMock(count = 1) {
+  return {
+    zremrangebyscore: vi.fn().mockReturnThis(),
+    zadd:             vi.fn().mockReturnThis(),
+    zcard:            vi.fn().mockReturnThis(),
+    pexpire:          vi.fn().mockReturnThis(),
+    hset:             vi.fn().mockReturnThis(),   // tokenBucket persist step
+    // ioredis pipeline.exec() returns [[err, val], [err, val], ...]
+    exec: vi.fn(async () => [
+      [null, 0],      // zremrangebyscore → 0 removed  (or hset tokens)
+      [null, 1],      // zadd → 1 added                (or hset lastRefill)
+      [null, count],  // zcard → count entries          (or pexpire)
+      [null, 1],      // pexpire → 1 (success)
+    ]),
+  };
+}
+
 vi.mock("../src/redis/client.js", () => ({
   redis: {
     incr: vi.fn(async () => {
@@ -37,9 +55,13 @@ vi.mock("../src/redis/client.js", () => ({
       if (mockRedisDown) throw new Error("ECONNREFUSED Redis is down");
       return "PONG";
     }),
-    set: vi.fn(async () => "OK"),
-    get: vi.fn(async () => "redis is working"),
-    on: vi.fn(),
+    set:      vi.fn(async () => "OK"),
+    get:      vi.fn(async () => "redis is working"),
+    hgetall:  vi.fn(async () => null),   // null → fresh bucket
+    hset:     vi.fn(async () => 1),
+    pipeline: vi.fn(() => makePipelineMock()),
+    zrange:   vi.fn(async () => []),     // empty → no oldest score
+    on:       vi.fn(),
   },
 }));
 
@@ -117,18 +139,10 @@ describe("Fixed window rate limiter", () => {
 
   // ── 3. Route-specific rule blocks after route limit ───────────────────────
   it("blocks /auth/login after 5 requests (route limit)", async () => {
-    // First call: global incr → 1 (allowed), route incr → 6 (blocked, limit=5)
-    // We set counter to 0, but calls happen in sequence so we need to control
-    // global (first incr) vs route (second incr) separately.
-    // We override the mock to return specific values per call.
+    // auth_login uses slidingWindow — mock pipeline to return count=6 (> max=5)
+    // Use mockReturnValueOnce so this override doesn't bleed into the next test.
     const { redis } = await import("../src/redis/client.js");
-    let callCount = 0;
-    redis.incr.mockImplementation(async () => {
-      callCount++;
-      // 1st call = global check → 1 (allowed)
-      // 2nd call = route check → 6 (blocked, route max=5)
-      return callCount === 1 ? 1 : 6;
-    });
+    redis.pipeline.mockReturnValueOnce(makePipelineMock(6)); // zcard result = 6
 
     const res = await request(app)
       .post("/auth/login")
@@ -141,14 +155,7 @@ describe("Fixed window rate limiter", () => {
 
   // ── 4. Route-specific rule allows requests within the route limit ─────────
   it("allows /auth/login when under the route limit", async () => {
-    const { redis } = await import("../src/redis/client.js");
-    let callCount = 0;
-    redis.incr.mockImplementation(async () => {
-      callCount++;
-      // 1st = global → 1, 2nd = route → 3 (limit=5, allowed)
-      return callCount === 1 ? 1 : 3;
-    });
-
+    // auth_login uses slidingWindow — default pipeline mock returns count=1 (< max=5)
     const res = await request(app)
       .post("/auth/login")
       .send({ email: "a@b.com", password: "123" });
@@ -226,12 +233,11 @@ describe("Fixed window rate limiter", () => {
 
   // ── 10. /api/data prefix matching works for nested paths ─────────────────
   it("applies api_data policy to /api/data/:id (prefix match)", async () => {
+    // api_data uses tokenBucket — mock hgetall to return a depleted bucket (0 tokens)
+    // Also ensure global IP incr returns 1 (well under 300) so only route check blocks
     const { redis } = await import("../src/redis/client.js");
-    let callCount = 0;
-    redis.incr.mockImplementation(async () => {
-      callCount++;
-      return callCount === 1 ? 1 : 101; // route incr → 101, limit=100 → blocked
-    });
+    redis.incr.mockResolvedValue(1);
+    redis.hgetall.mockResolvedValue({ tokens: "0", lastRefill: String(Date.now()) });
 
     const res = await request(app).get("/api/data/d1");
 

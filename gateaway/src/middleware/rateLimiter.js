@@ -1,16 +1,13 @@
 import { limits } from "../config/limits.js";
-import { buildFixedWindowKey } from "../limiter/redisKeys.js";
+import { buildFixedWindowKey, buildSlidingWindowKey, buildTokenBucketKey } from "../limiter/redisKeys.js";
 import { consumeFixedWindow } from "../limiter/fixedWindow.js";
+import { consumeSlidingWindow } from "../limiter/slidingWindow.js";
+import { consumeTokenBucket } from "../limiter/tokenBucket.js";
 import { setRateLimitHeaders } from "../limiter/header.js";
 import { getClientIp } from "../utils/getClientIp.js";
 import { logRateLimit } from "../utils/logger.js";
 import { recordRequest } from "../admin/stats.js";
 
-/**
- * Redis failure mode — read once at startup from env.
- *   "open"   → if Redis is down, allow all traffic through (availability wins)
- *   "closed" → if Redis is down, block all traffic with 503 (protection wins)
- */
 const REDIS_FAILURE_MODE = process.env.REDIS_FAILURE_MODE || "open";
 
 /**
@@ -26,46 +23,84 @@ function getRouteKey(req) {
   if (path.startsWith("/api/data")) return "api_data";
   if (path.startsWith("/users"))    return "users";
 
-  return null; // No specific policy — global limit only
+  return null;
+}
+
+/**
+ * Runs the correct rate limiting algorithm based on the policy config.
+ * All three algorithms return the same shape:
+ *   { allowed, limit, current, remaining, retryAfterMs }
+ *
+ * This means rateLimiter.js doesn't need to know which algorithm runs —
+ * it just calls runPolicy() and reads the result.
+ */
+async function runPolicy({ policy, identifier, routeKey, now }) {
+  const algorithm = policy.algorithm || "fixedWindow";
+
+  if (algorithm === "slidingWindow") {
+    const key = buildSlidingWindowKey({
+      scope: policy.scope || "ip",
+      identifier,
+      routeKey,
+    });
+    return consumeSlidingWindow({
+      key,
+      windowMs: policy.windowMs,
+      max: policy.max,
+    });
+  }
+
+  if (algorithm === "tokenBucket") {
+    const key = buildTokenBucketKey({
+      scope: policy.scope || "ip",
+      identifier,
+      routeKey,
+    });
+    return consumeTokenBucket({
+      key,
+      capacity:          policy.capacity          ?? policy.max,
+      refillRate:        policy.refillRate         ?? 1,
+      refillIntervalMs:  policy.refillIntervalMs   ?? 1000,
+      ttlMs:             policy.windowMs,
+    });
+  }
+
+  // Default: fixedWindow
+  const window = Math.floor(now / policy.windowMs);
+  const key = buildFixedWindowKey({
+    scope: policy.scope || "ip",
+    identifier,
+    routeKey,
+    window,
+  });
+  return consumeFixedWindow({
+    key,
+    windowMs: policy.windowMs,
+    max: policy.max,
+  });
 }
 
 export async function rateLimiter(req, res, next) {
   const now = Date.now();
   const ip = getClientIp(req);
-  const userId = req.headers["x-user-id"] || null; // Present when client is authenticated
+  const userId = req.headers["x-user-id"] || null;
   const routeKey = getRouteKey(req);
 
   try {
     // ── 1. Global IP check ──────────────────────────────────────────────────
-    const globalWindow = Math.floor(now / limits.globalIp.windowMs);
-    const globalKey = buildFixedWindowKey({
-      scope: "ip",
+    const globalResult = await runPolicy({
+      policy: limits.globalIp,
       identifier: ip,
-      window: globalWindow,
+      routeKey: null,
+      now,
     });
 
-    const globalResult = await consumeFixedWindow({
-      key: globalKey,
-      windowMs: limits.globalIp.windowMs,
-      max: limits.globalIp.max,
-    });
-
-    logRateLimit({
-      method: req.method,
-      path: req.path,
-      ip,
-      userId,
-      scope: "global_ip",
-      allowed: globalResult.allowed,
-      remaining: globalResult.remaining,
-      limit: globalResult.limit,
-    });
+    logRateLimit({ method: req.method, path: req.path, ip, userId, scope: "global_ip", allowed: globalResult.allowed, remaining: globalResult.remaining, limit: globalResult.limit });
     recordRequest({ allowed: globalResult.allowed, scope: "global_ip", routeKey });
 
     if (!globalResult.allowed) {
       setRateLimitHeaders(res, globalResult);
       res.setHeader("Retry-After", Math.ceil(globalResult.retryAfterMs / 1000));
-
       return res.status(429).json({
         error: "Too Many Requests",
         scope: "global_ip",
@@ -74,37 +109,21 @@ export async function rateLimiter(req, res, next) {
       });
     }
 
-    // ── 2. Per-user check (only if x-user-id header is present) ────────────
+    // ── 2. Per-user check (only if x-user-id present) ───────────────────────
     if (userId) {
-      const userWindow = Math.floor(now / limits.globalUser.windowMs);
-      const userKey = buildFixedWindowKey({
-        scope: "user",
+      const userResult = await runPolicy({
+        policy: limits.globalUser,
         identifier: userId,
-        window: userWindow,
+        routeKey: null,
+        now,
       });
 
-      const userResult = await consumeFixedWindow({
-        key: userKey,
-        windowMs: limits.globalUser.windowMs,
-        max: limits.globalUser.max,
-      });
-
-      logRateLimit({
-        method: req.method,
-        path: req.path,
-        ip,
-        userId,
-        scope: "global_user",
-        allowed: userResult.allowed,
-        remaining: userResult.remaining,
-        limit: userResult.limit,
-      });
+      logRateLimit({ method: req.method, path: req.path, ip, userId, scope: "global_user", allowed: userResult.allowed, remaining: userResult.remaining, limit: userResult.limit });
       recordRequest({ allowed: userResult.allowed, scope: "global_user", routeKey });
 
       if (!userResult.allowed) {
         setRateLimitHeaders(res, userResult);
         res.setHeader("Retry-After", Math.ceil(userResult.retryAfterMs / 1000));
-
         return res.status(429).json({
           error: "Too Many Requests",
           scope: "global_user",
@@ -121,46 +140,27 @@ export async function rateLimiter(req, res, next) {
     }
 
     const routePolicy = limits.routes[routeKey];
-    const routeWindow = Math.floor(now / routePolicy.windowMs);
+    const routeIdentifier = routePolicy.scope === "ip" ? ip : userId || ip;
 
-    // Auth routes always scope to IP even if user is known (brute-force protection)
-    const routeIdentifier =
-      routePolicy.scope === "ip" ? ip : userId || ip;
-
-    const routeKeyName = buildFixedWindowKey({
-      scope: routePolicy.scope || "ip",
+    const routeResult = await runPolicy({
+      policy: routePolicy,
       identifier: routeIdentifier,
       routeKey,
-      window: routeWindow,
+      now,
     });
 
-    const routeResult = await consumeFixedWindow({
-      key: routeKeyName,
-      windowMs: routePolicy.windowMs,
-      max: routePolicy.max,
-    });
-
-    logRateLimit({
-      method: req.method,
-      path: req.path,
-      ip,
-      userId,
-      scope: "ip_route",
-      allowed: routeResult.allowed,
-      remaining: routeResult.remaining,
-      limit: routeResult.limit,
-    });
+    logRateLimit({ method: req.method, path: req.path, ip, userId, scope: "ip_route", allowed: routeResult.allowed, remaining: routeResult.remaining, limit: routeResult.limit });
     recordRequest({ allowed: routeResult.allowed, scope: "ip_route", routeKey });
 
     setRateLimitHeaders(res, routeResult);
 
     if (!routeResult.allowed) {
       res.setHeader("Retry-After", Math.ceil(routeResult.retryAfterMs / 1000));
-
       return res.status(429).json({
         error: "Too Many Requests",
         scope: "ip_route",
         route: routeKey,
+        algorithm: routePolicy.algorithm || "fixedWindow",
         message: `Rate limit exceeded for ${req.path}`,
         retryAfterSeconds: Math.ceil(routeResult.retryAfterMs / 1000),
       });
@@ -169,25 +169,17 @@ export async function rateLimiter(req, res, next) {
     next();
 
   } catch (error) {
-    // ── Redis failure handling ───────────────────────────────────────────────
     const isRedisError =
       error.name === "ReplyError" ||
       error.message?.toLowerCase().includes("redis") ||
       error.message?.toLowerCase().includes("econnrefused");
 
     if (isRedisError) {
-      console.error(
-        `[${new Date().toISOString()}] [RateLimit] Redis failure: ${error.message} | mode=${REDIS_FAILURE_MODE}`
-      );
-
+      console.error(`[${new Date().toISOString()}] [RateLimit] Redis failure: ${error.message} | mode=${REDIS_FAILURE_MODE}`);
       if (REDIS_FAILURE_MODE === "open") {
-        // Fail open — let traffic through, log the risk
-        console.warn(
-          `[${new Date().toISOString()}] [RateLimit] FAIL OPEN — bypassing rate limit for ${req.method} ${req.path}`
-        );
+        console.warn(`[${new Date().toISOString()}] [RateLimit] FAIL OPEN — bypassing rate limit for ${req.method} ${req.path}`);
         return next();
       } else {
-        // Fail closed — protect the backend, reject all traffic
         return res.status(503).json({
           error: "Service Unavailable",
           message: "Rate limiting is temporarily unavailable. Please try again shortly.",
@@ -198,4 +190,3 @@ export async function rateLimiter(req, res, next) {
     next(error);
   }
 }
-
