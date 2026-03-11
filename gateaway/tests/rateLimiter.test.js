@@ -26,11 +26,12 @@ function makePipelineMock(count = 1) {
     zadd:             vi.fn().mockReturnThis(),
     zcard:            vi.fn().mockReturnThis(),
     pexpire:          vi.fn().mockReturnThis(),
+    hset:             vi.fn().mockReturnThis(),   // tokenBucket persist step
     // ioredis pipeline.exec() returns [[err, val], [err, val], ...]
     exec: vi.fn(async () => [
-      [null, 0],      // zremrangebyscore → 0 removed
-      [null, 1],      // zadd → 1 added
-      [null, count],  // zcard → count entries in window
+      [null, 0],      // zremrangebyscore → 0 removed  (or hset tokens)
+      [null, 1],      // zadd → 1 added                (or hset lastRefill)
+      [null, count],  // zcard → count entries          (or pexpire)
       [null, 1],      // pexpire → 1 (success)
     ]),
   };
@@ -139,8 +140,9 @@ describe("Fixed window rate limiter", () => {
   // ── 3. Route-specific rule blocks after route limit ───────────────────────
   it("blocks /auth/login after 5 requests (route limit)", async () => {
     // auth_login uses slidingWindow — mock pipeline to return count=6 (> max=5)
+    // Use mockReturnValueOnce so this override doesn't bleed into the next test.
     const { redis } = await import("../src/redis/client.js");
-    redis.pipeline.mockReturnValue(makePipelineMock(6)); // zcard result = 6
+    redis.pipeline.mockReturnValueOnce(makePipelineMock(6)); // zcard result = 6
 
     const res = await request(app)
       .post("/auth/login")
