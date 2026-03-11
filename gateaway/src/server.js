@@ -72,21 +72,29 @@ app.get("/admin/rate-limit-rules", (req, res) => {
       description: "Applied to every request regardless of route",
       windowMs: limits.globalIp.windowMs,
       max: limits.globalIp.max,
+      algorithm: limits.globalIp.algorithm ?? "fixedWindow",
       windowLabel: "60s",
     },
     globalUser: {
       description: "Applied to authenticated requests (x-user-id header present)",
       windowMs: limits.globalUser.windowMs,
       max: limits.globalUser.max,
+      algorithm: limits.globalUser.algorithm ?? "fixedWindow",
       windowLabel: "60s",
     },
-    routes: Object.entries(limits.routes).map(([key, policy]) => ({
-      routeKey: key,
-      windowMs: policy.windowMs,
-      max: policy.max,
-      scope: policy.scope,
-      windowLabel: "60s",
-    })),
+    routes: Object.fromEntries(
+      Object.entries(limits.routes).map(([key, policy]) => [
+        key,
+        {
+          windowMs: policy.windowMs,
+          max: policy.max,
+          scope: policy.scope,
+          algorithm: policy.algorithm ?? "fixedWindow",
+          capacity: policy.capacity,
+          windowLabel: "60s",
+        },
+      ])
+    ),
     redisFailureMode: process.env.REDIS_FAILURE_MODE || "open",
   });
 });

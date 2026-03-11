@@ -13,6 +13,8 @@ export async function forwardRequest(req, res) {
     "trailers",
     "transfer-encoding",
     "upgrade",
+    "host",           // let fetch set the correct host for the backend
+    "content-length", // will be recalculated by fetch after re-serialisation
   ]);
 
   for (const [key, value] of Object.entries(req.headers)) {
@@ -34,6 +36,9 @@ export async function forwardRequest(req, res) {
   if (!["GET", "HEAD"].includes(req.method)) {
     fetchOptions.body = JSON.stringify(req.body);
     fetchOptions.headers["content-type"] = "application/json";
+    // Remove the original content-length — it may differ from the
+    // re-serialised body and causes the backend to abort the request.
+    delete fetchOptions.headers["content-length"];
   }
 
   try {

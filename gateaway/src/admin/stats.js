@@ -7,6 +7,8 @@
  * and by server.js to expose via /admin/gateway-stats.
  */
 
+import { limits } from "../config/limits.js";
+
 const stats = {
   startedAt: new Date().toISOString(),
   totalRequests: 0,
@@ -73,5 +75,12 @@ export function getStats() {
     ...stats,
     uptimeSeconds,
     blockRate,
+    // Live route config so the Dashboard can show the correct algorithm per route
+    rules: Object.fromEntries(
+      Object.entries(limits.routes).map(([route, policy]) => [
+        route,
+        { algorithm: policy.algorithm ?? "fixedWindow" },
+      ])
+    ),
   };
 }

@@ -43,25 +43,35 @@ export async function consumeSlidingWindow({ key, windowMs, max }) {
   // Unique member — timestamp + random suffix handles burst requests at same ms
   const member = `${now}:${Math.random().toString(36).slice(2, 8)}`;
 
-  // Run all 4 Redis commands as a pipeline for atomicity and performance
+  // Phase 1: clean up expired entries and get current count BEFORE adding
   const pipeline = redis.pipeline();
-
-  // 1. Remove all timestamps older than the window start
   pipeline.zremrangebyscore(key, 0, windowStart);
-
-  // 2. Add this request's timestamp
-  pipeline.zadd(key, now, member);
-
-  // 3. Count all entries in the set = requests in the last windowMs
   pipeline.zcard(key);
+  const phase1 = await pipeline.exec();
 
-  // 4. Reset the key TTL so it cleans up if traffic stops
-  pipeline.pexpire(key, windowMs);
+  const countBefore = phase1[1][1]; // requests already in the window
 
-  const results = await pipeline.exec();
+  // If already at or over limit, deny without consuming a slot
+  if (countBefore >= max) {
+    const oldest = await redis.zrange(key, 0, 0, "WITHSCORES");
+    const oldestScore = oldest.length >= 2 ? parseInt(oldest[1]) : now;
+    const retryAfterMs = windowMs - (now - oldestScore);
+    return {
+      allowed: false,
+      limit: max,
+      current: countBefore,
+      remaining: 0,
+      retryAfterMs: retryAfterMs > 0 ? retryAfterMs : windowMs,
+    };
+  }
 
-  // zcard result is at index 2 — [err, value] tuple per command
-  const count = results[2][1];
+  // Phase 2: allowed — add the request and update TTL
+  const pipeline2 = redis.pipeline();
+  pipeline2.zadd(key, now, member);
+  pipeline2.pexpire(key, windowMs);
+  await pipeline2.exec();
+
+  const count = countBefore + 1;
 
   // Oldest entry score = when the oldest request in the window was made
   // retryAfter = when that oldest entry will fall out of the window
@@ -70,10 +80,10 @@ export async function consumeSlidingWindow({ key, windowMs, max }) {
   const retryAfterMs = windowMs - (now - oldestScore);
 
   return {
-    allowed: count <= max,
+    allowed: true,
     limit: max,
     current: count,
-    remaining: Math.max(0, max - count),
+    remaining: max - count,          // always >= 0 because we checked before adding
     retryAfterMs: retryAfterMs > 0 ? retryAfterMs : windowMs,
   };
 }
