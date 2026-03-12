@@ -83,7 +83,8 @@ async function buildApp(env = {}) {
   // Set env before importing modules that read it at load time
   Object.assign(process.env, {
     PORT: "4000",
-    REDIS_URL: "redis://localhost:6379",
+    REDIS_SENTINEL_HOSTS: "localhost:26379",
+    REDIS_MASTER_NAME: "mymaster",
     BACKEND_URL: "http://localhost:5001",
     REDIS_FAILURE_MODE: "open",
     ...env,

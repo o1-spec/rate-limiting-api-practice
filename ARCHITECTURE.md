@@ -112,7 +112,7 @@ so you can see which node handled it.
 ### Step 2 — Express receives in server.js
 
 `server.js` is the entry point of each gateway node. It:
-- Reads `PORT`, `REDIS_URL`, `BACKEND_URL`, `GATEWAY_ID` from environment
+- Reads `PORT`, `REDIS_SENTINEL_HOSTS`, `REDIS_MASTER_NAME`, `BACKEND_URL`, `GATEWAY_ID` from environment
 - Mounts CORS (allows `localhost:3000`, exposes rate limit headers)
 - Registers admin/health routes that **bypass** rate limiting
 - Registers `rateLimiter` middleware for all other routes
@@ -214,9 +214,11 @@ Gateway B: runs slidingWindow.lua atomically → sees A's ZADD, count=6 ❌ bloc
 ### Infrastructure
 
 #### `docker-compose.yml`
-Defines all 6 containers and wires them together on a private Docker network.
-The three gateways share `REDIS_URL: redis://redis:6379` — the hostname `redis`
-resolves to the Redis container via Docker's internal DNS.
+Defines all 12 containers and wires them together on a private Docker network.
+The three gateways connect to Redis via Sentinel — they pass `REDIS_SENTINEL_HOSTS`
+(comma-separated `host:port` list) and `REDIS_MASTER_NAME`, and ioredis queries the
+sentinels to discover the current primary. Docker's internal DNS resolves
+`sentinel-1`, `sentinel-2`, `sentinel-3` to the correct containers.
 
 #### `nginx.conf`
 Defines the `upstream gateways` block listing all three nodes.
@@ -233,7 +235,7 @@ Used by `docker-compose.yml` `build:` directives.
 
 #### `gateaway/src/server.js`
 The Express application. Responsibilities:
-- Reads all environment variables (`PORT`, `REDIS_URL`, `BACKEND_URL`, `GATEWAY_ID`, `REDIS_FAILURE_MODE`)
+- Reads all environment variables (`PORT`, `REDIS_SENTINEL_HOSTS`, `REDIS_MASTER_NAME`, `BACKEND_URL`, `GATEWAY_ID`, `REDIS_FAILURE_MODE`)
 - Registers CORS — exposes `X-RateLimit-*` headers to the browser
 - Mounts `rateLimiter` middleware before the proxy
 - Admin endpoints that **do not** go through rate limiting:
@@ -519,14 +521,15 @@ for all proxied requests until the backend recovers.
 ```
 rate-limiting-api/
 │
-├── docker-compose.yml              6 services: nginx, 3 gateways, redis, backend
+├── docker-compose.yml              12 services: nginx, 3 gateways, redis-primary, 2 replicas, 3 sentinels, backend
+├── sentinel.conf                   Sentinel monitor config (quorum=2, failover-timeout=10s)
 ├── nginx.conf                      round-robin upstream + X-Upstream-Addr header
 ├── ARCHITECTURE.md                 this file
 ├── README.md                       quick start + endpoint reference
 │
 ├── gateaway/
 │   ├── Dockerfile                  node:20-alpine — builds the gateway image
-│   ├── .env                        PORT, REDIS_URL, BACKEND_URL, REDIS_FAILURE_MODE
+│   ├── .env                        PORT, REDIS_SENTINEL_HOSTS, REDIS_MASTER_NAME, BACKEND_URL, REDIS_FAILURE_MODE
 │   ├── tests/
 │   │   └── rateLimiter.test.js     10 Vitest tests (all algorithms, tiers, failure modes)
 │   └── src/
@@ -583,7 +586,7 @@ rate-limiting-api/
 | Atomic Redis operations | `slidingWindow.lua`, `tokenBucket.lua`, `redis/client.js` |
 | Race condition (the bug Lua fixes) | Comments at top of both `.lua` files |
 | Stateless horizontal scaling | `docker-compose.yml` — 3 identical gateway services |
-| Shared state pattern | All 3 gateways use `REDIS_URL: redis://redis:6379` |
+| Shared state pattern | All 3 gateways connect to `redis-primary` via Sentinel discovery |
 | Reverse proxy | `proxy/forwardRequest.js` |
 | Hop-by-hop header stripping | `HOP_BY_HOP` set in `forwardRequest.js` |
 | Three-tier middleware | `middleware/rateLimiter.js` — `runPolicy()` function |

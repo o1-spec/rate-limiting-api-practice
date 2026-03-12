@@ -1,25 +1,93 @@
 version: "3.9"
 
 services:
-  # ── Redis ────────────────────────────────────────────────────────────────────
-  # Single shared Redis instance — the source of truth for all gateway nodes.
-  # Every rate-limit decision by gateway_a, gateway_b, or gateway_c reads from
-  # and writes to this one store. This is what makes the limiting distributed.
-  redis:
+  # ── Redis primary ─────────────────────────────────────────────────────────────
+  # The only node that accepts writes. Replicas mirror everything it writes.
+  redis-primary:
     image: redis:7-alpine
-    container_name: rate-limit-redis
+    container_name: redis-primary
     restart: unless-stopped
     ports:
       - "6380:6379"
     volumes:
-      - redis-data:/data
+      - redis-primary-data:/data
     command: redis-server --appendonly yes
 
+  # ── Redis replicas ────────────────────────────────────────────────────────────
+  # Read-only mirrors of the primary. If the primary dies, Sentinel promotes
+  # one of these to become the new primary automatically.
+  redis-replica-1:
+    image: redis:7-alpine
+    container_name: redis-replica-1
+    restart: unless-stopped
+    ports:
+      - "6381:6379"
+    command: redis-server --replicaof redis-primary 6379 --appendonly yes
+    depends_on:
+      - redis-primary
+
+  redis-replica-2:
+    image: redis:7-alpine
+    container_name: redis-replica-2
+    restart: unless-stopped
+    ports:
+      - "6382:6379"
+    command: redis-server --replicaof redis-primary 6379 --appendonly yes
+    depends_on:
+      - redis-primary
+
+  # ── Sentinel cluster ──────────────────────────────────────────────────────────
+  # Three sentinels watch the primary. If 2 of 3 agree it's unreachable,
+  # they trigger a failover — one replica is promoted to primary.
+  # ioredis asks a sentinel "who is the primary?" on every connect, so
+  # gateway nodes automatically reconnect to the new primary after failover.
+  sentinel-1:
+    image: redis:7-alpine
+    container_name: sentinel-1
+    restart: unless-stopped
+    ports:
+      - "26379:26379"
+    volumes:
+      - ./sentinel.conf:/etc/sentinel.conf
+    command: redis-sentinel /etc/sentinel.conf
+    depends_on:
+      - redis-primary
+      - redis-replica-1
+      - redis-replica-2
+
+  sentinel-2:
+    image: redis:7-alpine
+    container_name: sentinel-2
+    restart: unless-stopped
+    ports:
+      - "26380:26379"
+    volumes:
+      - ./sentinel.conf:/etc/sentinel.conf
+    command: redis-sentinel /etc/sentinel.conf
+    depends_on:
+      - redis-primary
+      - redis-replica-1
+      - redis-replica-2
+
+  sentinel-3:
+    image: redis:7-alpine
+    container_name: sentinel-3
+    restart: unless-stopped
+    ports:
+      - "26381:26379"
+    volumes:
+      - ./sentinel.conf:/etc/sentinel.conf
+    command: redis-sentinel /etc/sentinel.conf
+    depends_on:
+      - redis-primary
+      - redis-replica-1
+      - redis-replica-2
+
   # ── Gateway nodes ─────────────────────────────────────────────────────────────
-  # Three identical gateway instances. All share the same code (bind-mounted),
-  # the same Redis URL, and the same backend URL.
-  # GATEWAY_ID is injected purely for logging — so you can see in the gateway
-  # logs which node handled each request.
+  # Three identical gateway instances. All connect to Redis via Sentinel —
+  # they ask the sentinels "who is the primary?" and write only to that node.
+  # If the primary fails and a replica is promoted, ioredis detects it
+  # automatically and reconnects. No gateway restart needed.
   gateway_a:
     build: ./gateaway
     container_name: gateway_a
@@ -28,12 +96,15 @@ services:
       - "4000:4000"
     environment:
       PORT: 4000
-      REDIS_URL: redis://redis:6379
+      REDIS_SENTINEL_HOSTS: sentinel-1:26379,sentinel-2:26379,sentinel-3:26379
+      REDIS_MASTER_NAME: mymaster
       BACKEND_URL: http://backend:5001
       REDIS_FAILURE_MODE: open
       GATEWAY_ID: gateway_a
     depends_on:
-      - redis
+      - sentinel-1
+      - sentinel-2
+      - sentinel-3
       - backend
     volumes:
       - ./gateaway/src:/app/src
@@ -46,12 +117,15 @@ services:
       - "4001:4000"
     environment:
       PORT: 4000
-      REDIS_URL: redis://redis:6379
+      REDIS_SENTINEL_HOSTS: sentinel-1:26379,sentinel-2:26379,sentinel-3:26379
+      REDIS_MASTER_NAME: mymaster
       BACKEND_URL: http://backend:5001
       REDIS_FAILURE_MODE: open
       GATEWAY_ID: gateway_b
     depends_on:
-      - redis
+      - sentinel-1
+      - sentinel-2
+      - sentinel-3
       - backend
     volumes:
       - ./gateaway/src:/app/src
@@ -64,20 +138,20 @@ services:
       - "4002:4000"
     environment:
       PORT: 4000
-      REDIS_URL: redis://redis:6379
+      REDIS_SENTINEL_HOSTS: sentinel-1:26379,sentinel-2:26379,sentinel-3:26379
+      REDIS_MASTER_NAME: mymaster
       BACKEND_URL: http://backend:5001
       REDIS_FAILURE_MODE: open
       GATEWAY_ID: gateway_c
     depends_on:
-      - redis
+      - sentinel-1
+      - sentinel-2
+      - sentinel-3
       - backend
     volumes:
       - ./gateaway/src:/app/src
 
   # ── Nginx load balancer ───────────────────────────────────────────────────────
-  # Sits in front of all 3 gateways. Clients hit port 8080 and nginx round-robins
-  # requests across gateway_a, gateway_b, gateway_c.
-  # The X-Upstream-Addr response header tells you which gateway node was chosen.
   nginx:
     image: nginx:alpine
     container_name: rate-limit-nginx
@@ -100,4 +174,4 @@ services:
       - "5001:5001"
 
 volumes:
-  redis-data:
+  redis-primary-data:

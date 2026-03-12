@@ -153,7 +153,8 @@ npm run dev
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PORT` | `4000` | Gateway port |
-| `REDIS_URL` | `redis://localhost:6379` | Redis connection URL |
+| `REDIS_SENTINEL_HOSTS` | `localhost:26379` | Comma-separated `host:port` list of Sentinel nodes |
+| `REDIS_MASTER_NAME` | `mymaster` | Sentinel master set name |
 | `BACKEND_URL` | `http://localhost:5001` | Backend service URL |
 | `REDIS_FAILURE_MODE` | `open` | `open` = allow traffic if Redis is down; `closed` = block all traffic |
 
