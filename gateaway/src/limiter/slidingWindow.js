@@ -1,5 +1,5 @@
 /**
- * Sliding Window Rate Limiter
+ * Sliding Window Rate Limiter — Lua-backed atomic implementation
  *
  * WHY THIS EXISTS — the fixed window problem:
  *
@@ -16,74 +16,55 @@
  *   "How many requests in the last 60 seconds FROM NOW?"
  *   The window moves with every request — no boundary exploit.
  *
+ * WHY LUA — the distributed race condition:
+ *
+ *   Without atomicity, two gateway nodes can race:
+ *
+ *     Gateway A: ZCARD key → 4  (under limit, hasn't written yet)
+ *     Gateway B: ZCARD key → 4  (under limit, hasn't written yet)
+ *     Gateway A: ZADD key  → count becomes 5  ✅ allowed
+ *     Gateway B: ZADD key  → count becomes 6  ✅ allowed ← WRONG, should be blocked
+ *
+ *   The Lua script runs as a single atomic Redis command — no other client
+ *   can execute between ZCARD and ZADD. This is how production systems
+ *   handle distributed rate limiting correctly.
+ *
  * REDIS DATA STRUCTURE — Sorted Set:
  *
  *   Key:   rl:sw:ip:route:auth_login:127.0.0.1
  *   Score: timestamp in ms (e.g. 1741600123456)
  *   Value: unique request ID (timestamp:random to handle same-ms requests)
- *
- *   ZADD  key score member   → add this request's timestamp
- *   ZREMRANGEBYSCORE key 0 (now - windowMs)  → remove expired timestamps
- *   ZCARD key               → count remaining = requests in last windowMs
- *   EXPIRE key windowMs     → auto-cleanup if key goes idle
- *
- * TRADEOFF vs Fixed Window:
- *   ✅ No boundary burst exploit
- *   ✅ Smooth, accurate rolling count
- *   ❌ Stores one entry per request (more Redis memory)
- *   ❌ 3 Redis commands vs 2 for fixed window (slightly slower)
  */
 
 import { redis } from "../redis/client.js";
 
 export async function consumeSlidingWindow({ key, windowMs, max }) {
-  const now = Date.now();
+  const now         = Date.now();
   const windowStart = now - windowMs;
 
   // Unique member — timestamp + random suffix handles burst requests at same ms
   const member = `${now}:${Math.random().toString(36).slice(2, 8)}`;
 
-  // Phase 1: clean up expired entries and get current count BEFORE adding
-  const pipeline = redis.pipeline();
-  pipeline.zremrangebyscore(key, 0, windowStart);
-  pipeline.zcard(key);
-  const phase1 = await pipeline.exec();
+  // Single atomic Lua call — replaces the two-pipeline approach.
+  // Returns: [allowed, count, remaining, oldestScore, countBefore]
+  const [allowed, count, remaining, oldestScore] =
+    await redis.slidingWindowConsume(
+      key,          // KEYS[1]
+      now,          // ARGV[1]
+      windowStart,  // ARGV[2]
+      windowMs,     // ARGV[3]
+      max,          // ARGV[4]
+      member,       // ARGV[5]
+    );
 
-  const countBefore = phase1[1][1]; // requests already in the window
-
-  // If already at or over limit, deny without consuming a slot
-  if (countBefore >= max) {
-    const oldest = await redis.zrange(key, 0, 0, "WITHSCORES");
-    const oldestScore = oldest.length >= 2 ? parseInt(oldest[1]) : now;
-    const retryAfterMs = windowMs - (now - oldestScore);
-    return {
-      allowed: false,
-      limit: max,
-      current: countBefore,
-      remaining: 0,
-      retryAfterMs: retryAfterMs > 0 ? retryAfterMs : windowMs,
-    };
-  }
-
-  // Phase 2: allowed — add the request and update TTL
-  const pipeline2 = redis.pipeline();
-  pipeline2.zadd(key, now, member);
-  pipeline2.pexpire(key, windowMs);
-  await pipeline2.exec();
-
-  const count = countBefore + 1;
-
-  // Oldest entry score = when the oldest request in the window was made
-  // retryAfter = when that oldest entry will fall out of the window
-  const oldest = await redis.zrange(key, 0, 0, "WITHSCORES");
-  const oldestScore = oldest.length >= 2 ? parseInt(oldest[1]) : now;
   const retryAfterMs = windowMs - (now - oldestScore);
 
   return {
-    allowed: true,
-    limit: max,
-    current: count,
-    remaining: max - count,          // always >= 0 because we checked before adding
+    allowed:      allowed === 1,
+    limit:        max,
+    current:      count,
+    remaining:    remaining,
     retryAfterMs: retryAfterMs > 0 ? retryAfterMs : windowMs,
   };
 }
+

@@ -1,6 +1,10 @@
 version: "3.9"
 
 services:
+  # ── Redis ────────────────────────────────────────────────────────────────────
+  # Single shared Redis instance — the source of truth for all gateway nodes.
+  # Every rate-limit decision by gateway_a, gateway_b, or gateway_c reads from
+  # and writes to this one store. This is what makes the limiting distributed.
   redis:
     image: redis:7-alpine
     container_name: rate-limit-redis
@@ -10,6 +14,90 @@ services:
     volumes:
       - redis-data:/data
     command: redis-server --appendonly yes
+
+  # ── Gateway nodes ─────────────────────────────────────────────────────────────
+  # Three identical gateway instances. All share the same code (bind-mounted),
+  # the same Redis URL, and the same backend URL.
+  # GATEWAY_ID is injected purely for logging — so you can see in the gateway
+  # logs which node handled each request.
+  gateway_a:
+    build: ./gateaway
+    container_name: gateway_a
+    restart: unless-stopped
+    ports:
+      - "4000:4000"
+    environment:
+      PORT: 4000
+      REDIS_URL: redis://redis:6379
+      BACKEND_URL: http://backend:5001
+      REDIS_FAILURE_MODE: open
+      GATEWAY_ID: gateway_a
+    depends_on:
+      - redis
+      - backend
+    volumes:
+      - ./gateaway/src:/app/src
+
+  gateway_b:
+    build: ./gateaway
+    container_name: gateway_b
+    restart: unless-stopped
+    ports:
+      - "4001:4000"
+    environment:
+      PORT: 4000
+      REDIS_URL: redis://redis:6379
+      BACKEND_URL: http://backend:5001
+      REDIS_FAILURE_MODE: open
+      GATEWAY_ID: gateway_b
+    depends_on:
+      - redis
+      - backend
+    volumes:
+      - ./gateaway/src:/app/src
+
+  gateway_c:
+    build: ./gateaway
+    container_name: gateway_c
+    restart: unless-stopped
+    ports:
+      - "4002:4000"
+    environment:
+      PORT: 4000
+      REDIS_URL: redis://redis:6379
+      BACKEND_URL: http://backend:5001
+      REDIS_FAILURE_MODE: open
+      GATEWAY_ID: gateway_c
+    depends_on:
+      - redis
+      - backend
+    volumes:
+      - ./gateaway/src:/app/src
+
+  # ── Nginx load balancer ───────────────────────────────────────────────────────
+  # Sits in front of all 3 gateways. Clients hit port 8080 and nginx round-robins
+  # requests across gateway_a, gateway_b, gateway_c.
+  # The X-Upstream-Addr response header tells you which gateway node was chosen.
+  nginx:
+    image: nginx:alpine
+    container_name: rate-limit-nginx
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - gateway_a
+      - gateway_b
+      - gateway_c
+
+  # ── Backend ───────────────────────────────────────────────────────────────────
+  backend:
+    build: ./backend
+    container_name: rate-limit-backend
+    restart: unless-stopped
+    ports:
+      - "5001:5001"
 
 volumes:
   redis-data:

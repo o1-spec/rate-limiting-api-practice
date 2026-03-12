@@ -13,6 +13,7 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 4000;
 const BACKEND_URL = process.env.BACKEND_URL || "http://localhost:5001";
+const GATEWAY_ID  = process.env.GATEWAY_ID  || "gateway_standalone";
 const startTime = Date.now();
 
 app.use(cors({
@@ -55,13 +56,14 @@ app.get("/gateway/health", async (req, res) => {
   const healthy = redisStatus === "ok";
 
   res.status(healthy ? 200 : 503).json({
-    status: healthy ? "healthy" : "degraded",
-    service: "rate-limited-api-gateway",
-    uptime: `${uptimeSeconds}s`,
-    redis: redisStatus,
+    status:           healthy ? "healthy" : "degraded",
+    service:          "rate-limited-api-gateway",
+    gatewayId:        GATEWAY_ID,
+    uptime:           `${uptimeSeconds}s`,
+    redis:            redisStatus,
     redisFailureMode: process.env.REDIS_FAILURE_MODE || "open",
-    backend: BACKEND_URL,
-    timestamp: new Date().toISOString(),
+    backend:          BACKEND_URL,
+    timestamp:        new Date().toISOString(),
   });
 });
 
@@ -115,9 +117,9 @@ app.all("/{*path}", forwardRequest);
 app.use(errorHandler);
 
 app.listen(PORT, () => {
-  console.log(`\n🚀 Gateway running on   http://localhost:${PORT}`);
-  console.log(`📡 Proxying to backend  ${BACKEND_URL}`);
-  console.log(`🏥 Health:              http://localhost:${PORT}/gateway/health`);
-  console.log(`🔧 Admin rules:         http://localhost:${PORT}/admin/rate-limit-rules`);
-  console.log(`📊 Admin stats:         http://localhost:${PORT}/admin/gateway-stats\n`);
+  console.log(`\n🚀 [${GATEWAY_ID}] running on  http://localhost:${PORT}`);
+  console.log(`📡 Proxying to backend           ${BACKEND_URL}`);
+  console.log(`🏥 Health:                        http://localhost:${PORT}/gateway/health`);
+  console.log(`🔧 Admin rules:                   http://localhost:${PORT}/admin/rate-limit-rules`);
+  console.log(`📊 Admin stats:                   http://localhost:${PORT}/admin/gateway-stats\n`);
 });

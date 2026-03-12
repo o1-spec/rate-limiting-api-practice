@@ -1,5 +1,5 @@
 /**
- * Token Bucket Rate Limiter
+ * Token Bucket Rate Limiter — Lua-backed atomic implementation
  *
  * WHY THIS EXISTS — what sliding window still can't do:
  *
@@ -12,7 +12,7 @@
  * HOW IT WORKS:
  *
  *   Imagine a bucket that holds tokens (max = capacity).
- *   Tokens refill at a fixed rate (e.g. 10 tokens per second).
+ *   Tokens refill at a fixed rate (e.g. 2 tokens per second).
  *   Each request costs 1 token.
  *   If the bucket is empty → reject the request.
  *
@@ -20,23 +20,16 @@
  *   their bucket fills up and they can fire several requests quickly.
  *   But sustained abuse drains the bucket and they get throttled.
  *
- * EXAMPLE (capacity=5, refillRate=1 token/sec):
+ * WHY LUA — the double-spend race condition:
  *
- *   t=0s   bucket=5  → req ✅ bucket=4
- *   t=0s   bucket=4  → req ✅ bucket=3
- *   t=0s   bucket=3  → req ✅ bucket=2
- *   t=0s   bucket=2  → req ✅ bucket=1
- *   t=0s   bucket=1  → req ✅ bucket=0
- *   t=0s   bucket=0  → req ❌ BLOCKED
- *   t=1s   bucket=1  → req ✅ bucket=0  (1 token refilled)
- *   t=5s   bucket=5  → req ✅ bucket=4  (5 tokens refilled, capped at capacity)
+ *   Without atomicity, two gateways both see tokens=1:
  *
- * VS SLIDING WINDOW:
- *   ✅ Handles bursts naturally — clients can save up capacity
- *   ✅ Smooth throttling — never hard resets at window boundary
- *   ✅ More intuitive for APIs with bursty traffic patterns
- *   ❌ More complex refill logic
- *   ❌ Requires storing tokens + lastRefill timestamp
+ *     Gateway A: HGETALL → tokens=1 → allowed, writes tokens=0
+ *     Gateway B: HGETALL → tokens=1 → allowed, writes tokens=0
+ *     Both pass. The single token was spent twice.
+ *
+ *   The Lua script is atomic — Redis processes it as one indivisible command.
+ *   Gateway B's script sees tokens=0 (Gateway A already updated it).
  *
  * REDIS DATA STRUCTURE — Hash:
  *
@@ -48,11 +41,11 @@ import { redis } from "../redis/client.js";
 
 /**
  * @param {object} opts
- * @param {string} opts.key          - Redis key for this client+route
- * @param {number} opts.capacity     - Max tokens the bucket can hold
- * @param {number} opts.refillRate   - Tokens added per refillIntervalMs
- * @param {number} opts.refillIntervalMs - How often tokens are added (e.g. 1000 = per second)
- * @param {number} [opts.ttlMs]      - How long to keep the key if idle (default: 60s)
+ * @param {string} opts.key              - Redis key for this client+route
+ * @param {number} opts.capacity         - Max tokens the bucket can hold
+ * @param {number} opts.refillRate       - Tokens added per refillIntervalMs
+ * @param {number} opts.refillIntervalMs - How often tokens are added (ms)
+ * @param {number} [opts.ttlMs]          - Key TTL for idle cleanup (default: 60s)
  */
 export async function consumeTokenBucket({
   key,
@@ -63,58 +56,24 @@ export async function consumeTokenBucket({
 }) {
   const now = Date.now();
 
-  // Load existing bucket state from Redis
-  const data = await redis.hgetall(key);
-
-  let tokens;
-  let lastRefill;
-
-  if (!data || !data.tokens) {
-    // Brand new client — start with a full bucket
-    tokens = capacity;
-    lastRefill = now;
-  } else {
-    tokens = parseFloat(data.tokens);
-    lastRefill = parseInt(data.lastRefill);
-  }
-
-  // ── Refill calculation ──────────────────────────────────────────────────────
-  // How many full refill intervals have passed since last refill?
-  const elapsed = now - lastRefill;
-  const intervalsElapsed = Math.floor(elapsed / refillIntervalMs);
-  const tokensToAdd = intervalsElapsed * refillRate;
-
-  if (tokensToAdd > 0) {
-    // Add tokens but don't exceed capacity
-    tokens = Math.min(capacity, tokens + tokensToAdd);
-    // Advance lastRefill by whole intervals only (don't lose partial interval progress)
-    lastRefill = lastRefill + intervalsElapsed * refillIntervalMs;
-  }
-
-  // ── Consume one token ───────────────────────────────────────────────────────
-  const allowed = tokens >= 1;
-
-  if (allowed) {
-    tokens -= 1;
-  }
-
-  // ── Persist updated state ───────────────────────────────────────────────────
-  const pipeline = redis.pipeline();
-  pipeline.hset(key, "tokens", tokens.toString());
-  pipeline.hset(key, "lastRefill", lastRefill.toString());
-  pipeline.pexpire(key, ttlMs); // auto-cleanup idle keys
-  await pipeline.exec();
-
-  // How long until the next token is available?
-  const msUntilNextToken = allowed
-    ? 0
-    : refillIntervalMs - (now - lastRefill);
+  // Single atomic Lua call — replaces the HGETALL → compute → HSET sequence.
+  // Returns: [allowed, tokens, msUntilNextToken, capacity]
+  const [allowed, tokens, msUntilNextToken] =
+    await redis.tokenBucketConsume(
+      key,              // KEYS[1]
+      now,              // ARGV[1]
+      capacity,         // ARGV[2]
+      refillRate,       // ARGV[3]
+      refillIntervalMs, // ARGV[4]
+      ttlMs,            // ARGV[5]
+    );
 
   return {
-    allowed,
-    limit: capacity,
-    current: Math.floor(tokens),     // tokens remaining after this request
-    remaining: Math.floor(tokens),   // same — tokens left to spend
+    allowed:      allowed === 1,
+    limit:        capacity,
+    current:      tokens,
+    remaining:    tokens,
     retryAfterMs: msUntilNextToken > 0 ? msUntilNextToken : refillIntervalMs,
   };
 }
+
