@@ -1,346 +1,435 @@
 # System Architecture — Rate-Limited API Gateway
 
-## Overview
-
-This project is a **two-service system** that demonstrates how a production-style API gateway
-works. All traffic from clients flows through the gateway first. The gateway enforces
-**three-tier rate limiting** across three different algorithms, logs every decision, tracks
-live stats, and proxies allowed requests to the backend. The backend never sees throttled
-traffic — it only receives requests that have already passed all of the gateway's checks.
+> Branch: `feat/atomic-implementation`
+> Last updated: March 2026
 
 ---
 
-## High-Level Request Flow
+## What Kind of System This Is
+
+This is a **horizontally-scalable, stateless API gateway cluster with atomic distributed rate limiting backed by a shared Redis store**.
+
+In plain terms:
+- Multiple independent gateway processes handle requests
+- None of them store any state themselves
+- All of them read and write to the same Redis
+- Redis Lua scripts make every rate limit decision atomic — no race conditions even when all three gateways fire simultaneously
+
+This is the same architecture used by Kong, AWS API Gateway, and Cloudflare Workers.
+
+---
+
+## High-Level Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                          CLIENT                                 │
-│              (curl, browser, frontend app, etc.)                │
-└───────────────────────────┬─────────────────────────────────────┘
-                            │  HTTP Request
+                         CLIENT
+                (curl / browser / frontend)
+                            │
                             ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                     API GATEWAY  :4000                          │
-│                                                                 │
-│   ┌── Admin / Health routes (bypass rate limiting) ──────────┐ │
-│   │  GET /gateway/health        Redis ping + uptime           │ │
-│   │  GET /admin/rate-limit-rules  All active policies         │ │
-│   │  GET /admin/gateway-stats     Live counters + block rate  │ │
-│   └───────────────────────────────────────────────────────────┘ │
-│                                                                 │
-│   ┌── Three-tier rate limiter (all proxied routes) ──────────┐ │
-│   │  Tier 1: Global IP    300 req/min  fixedWindow           │ │
-│   │  Tier 2: Per-user     500 req/min  fixedWindow           │ │
-│   │          (only when x-user-id header is present)         │ │
-│   │  Tier 3: Per-route    algorithm chosen per route         │ │
-│   │          /auth/login    5 req/min  slidingWindow         │ │
-│   │          /auth/register 10 req/min slidingWindow         │ │
-│   │          /api/data/*   100 req/min tokenBucket           │ │
-│   │          /users/*       60 req/min fixedWindow           │ │
-│   └───────────────────────────────────────────────────────────┘ │
-│                                                                 │
-│   ┌── Proxy (passes only if all tiers allowed) ──────────────┐ │
-│   │  Forwards request to BACKEND:5001                        │ │
-│   └───────────────────────────────────────────────────────────┘ │
-└───────────┬────────────────────────────┬────────────────────────┘
-            │  Redis commands             │  HTTP Proxy (fetch)
-            ▼                            ▼
-┌───────────────────┐       ┌────────────────────────────────────┐
-│   Redis  :6379    │       │         BACKEND  :5001             │
-│  (Docker)         │       │                                    │
-│                   │       │  GET  /health                      │
-│  rl:fw:*  integer │       │  POST /auth/login                  │
-│  rl:sw:*  sorted  │       │  POST /auth/register               │
-│           set     │       │  POST /auth/logout                 │
-│  rl:tb:*  hash    │       │  GET  /users  /users/:id           │
-│                   │       │  GET  /api/data  /api/data/:id     │
-└───────────────────┘       └────────────────────────────────────┘
+              ┌─────────────────────────┐
+              │   nginx  :8080          │  ← load balancer
+              │   round-robin           │    adds X-Upstream-Addr header
+              └──────┬────────┬─────────┘
+                     │        │
+           ┌─────────┘        └──────────┐
+           ▼                             ▼
+  ┌─────────────────┐         ┌─────────────────┐
+  │  gateway_a:4000 │         │  gateway_b:4001 │  ...gateway_c:4002
+  │  (Node.js)      │         │  (Node.js)      │
+  └────────┬────────┘         └────────┬────────┘
+           │                           │
+           └─────────┬─────────────────┘
+                     │  Lua scripts (atomic)
+                     ▼
+              ┌─────────────────┐
+              │   Redis  :6380  │  ← single source of truth
+              │                 │    all rate limit state lives here
+              │  rl:fw:*  int   │
+              │  rl:sw:*  zset  │
+              │  rl:tb:*  hash  │
+              └─────────────────┘
+                     │
+                     ▼  (only if all rate checks pass)
+              ┌─────────────────┐
+              │  backend :5001  │  ← internal only, never public-facing
+              └─────────────────┘
 ```
 
 ---
 
-## Services
+## Services (docker-compose.yml)
 
-### 1. API Gateway (`gateaway/`) — Port 4000
+Six containers, one Docker network. They discover each other by service name — `redis`,
+`backend`, `gateway_a` etc. are valid hostnames inside the network.
 
-The gateway is the **only public-facing service**. Clients never talk directly to the backend.
+| Container | Host port | Internal port | Role |
+|-----------|-----------|---------------|------|
+| `nginx` | 8080 | 80 | Load balancer — round-robins to all 3 gateways |
+| `gateway_a` | 4000 | 4000 | Gateway node 1 |
+| `gateway_b` | 4001 | 4000 | Gateway node 2 |
+| `gateway_c` | 4002 | 4000 | Gateway node 3 |
+| `redis` | 6380 | 6379 | Rate limit state store |
+| `backend` | 5001 | 5001 | Business logic API |
 
-**Responsibilities:**
-- Receive all incoming HTTP requests
-- Extract the real client IP (`x-forwarded-for` or `req.ip`)
-- Run three sequential rate limit tiers on every proxied request
-- Choose the correct algorithm per route (fixed window / sliding window / token bucket)
-- Log every rate limit decision with structured output
-- Track live stats: total requests, blocked count, block rate, per-scope and per-route breakdowns
-- Forward allowed requests to the backend via native `fetch`
-- Return `429 Too Many Requests` with `Retry-After` and `X-RateLimit-*` headers when limits are exceeded
-- Expose admin and health endpoints that bypass rate limiting
-- Handle Redis failures gracefully via fail-open or fail-closed mode
+All three gateways run **identical code**. The only difference is the `GATEWAY_ID`
+environment variable (`gateway_a` / `gateway_b` / `gateway_c`) which is purely for
+logging — so you can see in the logs which node handled each request.
 
-**Does NOT:**
-- Authenticate users
-- Store any business data
-- Know anything about the backend's domain logic
+### Why three identical nodes?
 
----
+Because the nodes are stateless (no in-process state between requests), you can:
+- Add more nodes without changing anything else
+- Lose a node and the other two keep working
+- Deploy a new version by replacing nodes one at a time
 
-### 2. Backend API (`backend/`) — Port 5001
-
-A standard REST API that handles business logic. It is **not publicly exposed** — only the
-gateway talks to it.
-
-**Responsibilities:**
-- Handle auth routes (login, register, logout)
-- Serve user data and data records
-- Validate request inputs
-- Return proper HTTP status codes and JSON responses
-
-**Does NOT:**
-- Perform any rate limiting
-- Know about Redis
-- Know about the gateway
+This is called **horizontal scaling**.
 
 ---
 
-### 3. Redis (`Docker`) — Port 6379
+## Request Lifecycle — Step by Step
 
-Used exclusively by the gateway as a **fast, shared state store** for rate limiting.
-Each algorithm uses a different Redis data structure suited to its needs.
-
-**Key patterns by algorithm:**
+### Step 1 — nginx receives the request
 
 ```
-# Fixed Window — single integer key, auto-deletes at window end via TTL
-rl:fw:{scope}:global:{identifier}:{window}
-rl:fw:{scope}:route:{routeKey}:{identifier}:{window}
-
-# Sliding Window — sorted set, member = request timestamp, score = ms timestamp
-# Old entries pruned on every request with ZREMRANGEBYSCORE
-rl:sw:{scope}:route:{routeKey}:{identifier}
-
-# Token Bucket — hash with two fields: tokens + lastRefill timestamp
-# State updated in place on every request
-rl:tb:{scope}:route:{routeKey}:{identifier}
+Client → nginx:8080
 ```
 
-No cron jobs or cleanup workers are needed. Fixed window keys expire via TTL.
-Sliding window keys use `PEXPIRE` reset on each request. Token bucket keys
-use `PEXPIRE` to clean up idle clients.
+`nginx.conf` defines an upstream group:
+
+```nginx
+upstream gateways {
+  server gateway_a:4000;
+  server gateway_b:4000;
+  server gateway_c:4000;
+}
+```
+
+Nginx picks the next node in round-robin order and adds `X-Upstream-Addr` to the response
+so you can see which node handled it.
 
 ---
 
-## Rate Limiting Architecture
+### Step 2 — Express receives in server.js
 
-### Three-Tier Check
+`server.js` is the entry point of each gateway node. It:
+- Reads `PORT`, `REDIS_URL`, `BACKEND_URL`, `GATEWAY_ID` from environment
+- Mounts CORS (allows `localhost:3000`, exposes rate limit headers)
+- Registers admin/health routes that **bypass** rate limiting
+- Registers `rateLimiter` middleware for all other routes
+- Registers `forwardRequest` catch-all proxy after the middleware
 
-Every proxied request passes through three sequential checks in `rateLimiter.js`.
-A request is blocked as soon as it fails any tier — it does not continue to the next.
+```javascript
+app.use(rateLimiter);           // rate check on every proxied request
+app.all("/{*path}", forwardRequest);  // proxy allowed requests to backend
+```
+
+The `GATEWAY_ID` env var appears in logs and the `/gateway/health` response so you
+know which node you're talking to.
+
+---
+
+### Step 3 — rateLimiter.js runs three sequential checks
+
+Every proxied request goes through `gateaway/src/middleware/rateLimiter.js`.
+A request is **stopped at the first tier it fails** — it does not continue.
 
 ```
-Incoming request
-        │
-        ▼
-┌───────────────────────────────────────────────────────────────┐
-│  TIER 1 — Global IP                                           │
-│  identifier: client IP                                        │
-│  algorithm:  fixedWindow                                      │
-│  limit:      300 req / 60s  (applies to ALL routes)          │
-│  Redis key:  rl:fw:ip:global:{ip}:{window}                   │
-│                                                               │
-│  Blocked → 429  { scope: "global_ip" }                       │
-└───────────────────────────────────────────────────────────────┘
-        │ allowed
-        ▼
-┌───────────────────────────────────────────────────────────────┐
-│  TIER 2 — Per-user  (only when x-user-id header is present)   │
-│  identifier: value of x-user-id header                        │
-│  algorithm:  fixedWindow                                      │
-│  limit:      500 req / 60s                                    │
-│  Redis key:  rl:fw:user:global:{userId}:{window}             │
-│                                                               │
-│  Skipped entirely when request has no x-user-id header.      │
-│  Blocked → 429  { scope: "global_user" }                     │
-└───────────────────────────────────────────────────────────────┘
-        │ allowed (or skipped)
-        ▼
-┌───────────────────────────────────────────────────────────────┐
-│  TIER 3 — Route-level                                         │
-│  identifier: IP (scope:"ip") or userId (scope:"user")         │
-│  algorithm:  chosen per route in limits.js                    │
-│                                                               │
-│  /auth/login    → slidingWindow  max=5    key: rl:sw:ip:...  │
-│  /auth/register → slidingWindow  max=10   key: rl:sw:ip:...  │
-│  /api/data/*    → tokenBucket    cap=100  key: rl:tb:ip:...  │
-│  /users/*       → fixedWindow    max=60   key: rl:fw:ip:...  │
-│  other paths    → no policy, skip tier 3                     │
-│                                                               │
-│  Blocked → 429  { scope: "ip_route", route: routeKey }       │
-└───────────────────────────────────────────────────────────────┘
-        │ allowed
-        ▼
-  setRateLimitHeaders()   X-RateLimit-Limit/Remaining/Reset
-        │
-        ▼
-  forwardRequest()  →  backend:5001
+Request
+  │
+  ▼
+TIER 1 — Global IP check (fixedWindow)
+  identifier: client IP
+  limit: 300 req / 60s — applies to every route
+  key: rl:fw:ip:global:{ip}:{window}
+  fail → 429 { scope: "global_ip" }
+  │
+  ▼ (only if allowed)
+TIER 2 — Per-user check (fixedWindow)
+  identifier: x-user-id header value
+  limit: 500 req / 60s
+  key: rl:fw:user:global:{userId}:{window}
+  SKIPPED entirely when no x-user-id header is present
+  fail → 429 { scope: "global_user" }
+  │
+  ▼ (only if allowed or skipped)
+TIER 3 — Route-level check (algorithm per route)
+  /auth/login    → slidingWindow  max=5    key: rl:sw:ip:route:auth_login:{ip}
+  /auth/register → slidingWindow  max=10   key: rl:sw:ip:route:auth_register:{ip}
+  /api/data/*    → tokenBucket    cap=100  key: rl:tb:ip:route:api_data:{ip}
+  /users/*       → fixedWindow    max=60   key: rl:fw:ip:route:users:{ip}:{window}
+  other paths    → no policy, skip tier 3
+  fail → 429 { scope: "ip_route", route: routeKey, algorithm: "..." }
+  │
+  ▼ (all passed)
+setRateLimitHeaders() → X-RateLimit-Limit / Remaining / Reset
+  │
+  ▼
+forwardRequest() → backend:5001
+```
+
+The key function inside `rateLimiter.js` is `runPolicy()`. It reads `policy.algorithm`
+and calls the right implementation. This means `rateLimiter.js` never needs to change
+when you swap an algorithm — edit one field in `limits.js`:
+
+```javascript
+// rateLimiter.js never changes. Only limits.js changes.
+runPolicy({ policy, identifier, routeKey, now })
+  ├── "slidingWindow" → consumeSlidingWindow()
+  ├── "tokenBucket"   → consumeTokenBucket()
+  └── default         → consumeFixedWindow()
 ```
 
 ---
 
-### Route Matching — Prefix-Based
+### Step 4 — Lua script executes atomically in Redis
 
-`getRouteKey()` in `rateLimiter.js` maps paths to policy keys using prefix matching.
-This means `/users/1`, `/users/2`, `/api/data/abc` all resolve to the same policy.
+This is the core of the `feat/atomic-implementation` branch.
+
+**The problem Lua solves:**
+
+Without atomic scripts, two gateway nodes racing on the same key can both allow a
+request that should have been blocked:
 
 ```
-/auth/login       → "auth_login"    (exact match)
-/auth/register    → "auth_register" (exact match)
-/api/data         → "api_data"      (startsWith)
-/api/data/123     → "api_data"      (startsWith — same policy)
-/users            → "users"         (startsWith)
-/users/1          → "users"         (startsWith — same policy)
-/anything/else    → null            (global tiers only, no route policy)
+Gateway A: ZCARD key → 4    (reads: under limit)
+Gateway B: ZCARD key → 4    (reads: under limit — A hasn't written yet)
+Gateway A: ZADD key  → 5    ✅ allowed
+Gateway B: ZADD key  → 6    ✅ allowed  ← WRONG. Should have been blocked.
+```
+
+**With Lua:**
+
+Redis executes Lua scripts as a single atomic operation. No other command from any
+client can run between any two lines of the script.
+
+```
+Gateway A: runs slidingWindow.lua atomically → count=5 ✅
+Gateway B: runs slidingWindow.lua atomically → sees A's ZADD, count=6 ❌ blocked
 ```
 
 ---
 
-### The Three Algorithms
+## Core Files — What Each One Does
 
-All three algorithms return the same shape so `rateLimiter.js` is algorithm-agnostic:
+### Infrastructure
 
-```js
+#### `docker-compose.yml`
+Defines all 6 containers and wires them together on a private Docker network.
+The three gateways share `REDIS_URL: redis://redis:6379` — the hostname `redis`
+resolves to the Redis container via Docker's internal DNS.
+
+#### `nginx.conf`
+Defines the `upstream gateways` block listing all three nodes.
+Adds `X-Upstream-Addr` to every response so you can see which gateway handled the request.
+Passes `X-Real-IP` and `X-Forwarded-For` so gateways see the real client IP, not nginx's IP.
+
+#### `gateaway/Dockerfile` + `backend/Dockerfile`
+`node:20-alpine` images. `npm install` then `node src/server.js`.
+Used by `docker-compose.yml` `build:` directives.
+
+---
+
+### Gateway — Entry Point
+
+#### `gateaway/src/server.js`
+The Express application. Responsibilities:
+- Reads all environment variables (`PORT`, `REDIS_URL`, `BACKEND_URL`, `GATEWAY_ID`, `REDIS_FAILURE_MODE`)
+- Registers CORS — exposes `X-RateLimit-*` headers to the browser
+- Mounts `rateLimiter` middleware before the proxy
+- Admin endpoints that **do not** go through rate limiting:
+  - `GET /gateway/health` — Redis ping, uptime, which node this is (`gatewayId`)
+  - `GET /admin/rate-limit-rules` — live policy config read from `limits.js`
+  - `GET /admin/gateway-stats` — live counters from `stats.js`
+- Startup log prints `[gateway_a] running on :4000` so Docker logs identify each node
+
+---
+
+### Gateway — Configuration
+
+#### `gateaway/src/config/limits.js`
+**Single source of truth for all rate limit policies.**
+This is the only file you edit to change a limit, add a route, or swap an algorithm.
+
+```javascript
+export const limits = {
+  globalIp:   { windowMs, max, algorithm: "fixedWindow" },
+  globalUser: { windowMs, max, algorithm: "fixedWindow" },
+  routes: {
+    auth_login:    { max: 5,   algorithm: "slidingWindow", ... },
+    auth_register: { max: 10,  algorithm: "slidingWindow", ... },
+    api_data:      { capacity: 100, algorithm: "tokenBucket", refillRate: 2, ... },
+    users:         { max: 60,  algorithm: "fixedWindow",   ... },
+  }
+}
+```
+
+---
+
+### Gateway — Middleware
+
+#### `gateaway/src/middleware/rateLimiter.js`
+The three-tier orchestrator. Runs on every proxied request.
+- Extracts client IP via `getClientIp()`
+- Extracts `x-user-id` header for per-user checks
+- Calls `getRouteKey()` to map paths to policy keys using prefix matching
+- Calls `runPolicy()` for each tier — the function is algorithm-agnostic
+- Calls `recordRequest()` to update in-memory stats
+- Calls `logRateLimit()` to emit a structured log line
+- Sets `X-RateLimit-*` headers via `setRateLimitHeaders()`
+- Returns `429` with `Retry-After` if any tier blocks
+
+#### `gateaway/src/middleware/errorHandler.js`
+Centralized Express error handler. Maps error types to correct HTTP status codes.
+Catches bad JSON, Redis errors, proxy errors, and unexpected exceptions.
+
+---
+
+### Gateway — Redis Client
+
+#### `gateaway/src/redis/client.js`
+Creates a single shared `ioredis` connection. **Also registers the Lua scripts.**
+
+```javascript
+// Loads .lua files from disk at startup
+const slidingWindowLua = readFileSync("limiter/scripts/slidingWindow.lua");
+const tokenBucketLua   = readFileSync("limiter/scripts/tokenBucket.lua");
+
+// Registers them as named commands on the redis instance
+redis.defineCommand("slidingWindowConsume", { numberOfKeys: 1, lua: slidingWindowLua });
+redis.defineCommand("tokenBucketConsume",   { numberOfKeys: 1, lua: tokenBucketLua   });
+```
+
+`defineCommand` makes ioredis call `EVALSHA` on every invocation (uses a cached SHA
+of the script). If Redis restarts and loses the cache, ioredis automatically retries
+with `EVAL` (full source). From this point, calling `redis.slidingWindowConsume(...)`
+is identical to calling any native Redis command.
+
+---
+
+### Gateway — Algorithms
+
+All three algorithm functions return the same shape so the middleware is algorithm-agnostic:
+
+```javascript
 { allowed: bool, limit: N, current: N, remaining: N, retryAfterMs: N }
 ```
 
-#### Fixed Window (`limiter/fixedWindow.js`)
-
-Best for: global checks, high-traffic routes where simplicity matters.
-
-```
-INCR  key              ← atomically increment counter
-  └── if count === 1 → PEXPIRE key windowMs   (set TTL on first request)
-PTTL  key              ← time remaining in window
-```
-
-- Redis data: single integer key
-- Key rotates automatically via TTL — no cleanup needed
-- Trade-off: clients can double their effective rate across a window boundary
-
-#### Sliding Window (`limiter/slidingWindow.js`)
-
-Best for: brute-force protection (login, register) where boundary exploits are unacceptable.
+#### `gateaway/src/limiter/fixedWindow.js`
+The simplest algorithm. Two Redis commands:
 
 ```
-pipeline:
-  ZREMRANGEBYSCORE key 0 (now - windowMs)   ← evict expired timestamps
-  ZADD key score=now member="now:random"    ← record this request
-  ZCARD key                                 ← count = requests in last windowMs
-  PEXPIRE key windowMs                      ← TTL for idle key cleanup
-
-ZRANGE key 0 0 WITHSCORES   ← oldest entry → used to calculate retryAfterMs
+INCR key          ← atomically increment counter
+  if count === 1 → PEXPIRE key windowMs   ← set TTL on first request only
+PTTL key          ← remaining time in window → retryAfterMs
 ```
 
-- Redis data: sorted set — score is timestamp ms, member is unique per request
-- Window is always "last N seconds from right now" — no wall-clock boundary to exploit
-- Trade-off: stores one entry per request (more memory than fixed window)
+- Redis structure: single integer key
+- Key auto-deletes when TTL expires — no cleanup needed
+- **Trade-off:** clients can double their rate by firing across a window boundary
+- **Used for:** global IP (300/min), global user (500/min), `/users` (60/min)
+- `INCR` is atomic on its own — no Lua needed here
 
-#### Token Bucket (`limiter/tokenBucket.js`)
-
-Best for: API endpoints where legitimate clients burst (SDK retries, batch jobs).
+#### `gateaway/src/limiter/slidingWindow.js`
+Backed by `limiter/scripts/slidingWindow.lua`. The Lua script runs atomically:
 
 ```
-HGETALL key                  ← load bucket: { tokens, lastRefill }
-  └── if null → full bucket (tokens = capacity, lastRefill = now)
+ZREMRANGEBYSCORE key 0 windowStart   ← evict timestamps older than window
+ZCARD key                            ← count = requests in last windowMs RIGHT NOW
+if count >= max → return blocked     ← check BEFORE adding — no slot wasted
+ZADD key score=now member="ts:rand"  ← record this request
+PEXPIRE key windowMs                 ← reset idle TTL
+ZRANGE key 0 0 WITHSCORES           ← oldest entry → calculate retryAfterMs
+```
 
+- Redis structure: sorted set — score is ms timestamp, member is unique per request
+- Window is always "last 60s from right now" — no wall-clock boundary to exploit
+- **Trade-off:** stores one entry per request (more Redis memory than fixed window)
+- **Used for:** `/auth/login` (5/min), `/auth/register` (10/min) — brute-force protection
+
+#### `gateaway/src/limiter/tokenBucket.js`
+Backed by `limiter/scripts/tokenBucket.lua`. The Lua script runs atomically:
+
+```
+HGETALL key                          ← load { tokens, lastRefill }
+  if empty → start with full bucket  ← new client gets full capacity
 elapsed = now - lastRefill
-tokensToAdd = floor(elapsed / refillIntervalMs) × refillRate
-tokens = min(capacity, tokens + tokensToAdd)
-
-allowed = tokens >= 1
-if allowed → tokens -= 1
-
-pipeline:
-  HSET key tokens <new>
-  HSET key lastRefill <new>
-  PEXPIRE key ttlMs
+intervals = floor(elapsed / refillIntervalMs)
+tokens = min(capacity, tokens + intervals × refillRate)  ← refill
+lastRefill += intervals × refillIntervalMs               ← advance clock (whole intervals only)
+if tokens >= 1 → tokens -= 1 → allowed
+HSET key tokens <new> lastRefill <new>
+PEXPIRE key ttlMs
 ```
 
-- Redis data: hash with two fields (`tokens`, `lastRefill`)
-- Clients who haven't requested recently accumulate saved capacity for bursts
-- `api_data` config: capacity=100, refillRate=2/sec → 120 tokens/min sustained, with up to 100 burst
+- Redis structure: hash with two fields — `tokens` (float) and `lastRefill` (ms timestamp)
+- Clients who haven't requested recently accumulate capacity for a burst
+- `lastRefill` advances by **whole intervals only** — partial interval progress is preserved,
+  preventing token drift over long periods
+- **Trade-off:** more complex logic, requires storing state per client
+- **Used for:** `/api/data` (capacity=100, refill=2/sec — allows 100-request burst then 120/min sustained)
+
+#### `gateaway/src/limiter/redisKeys.js`
+Builds namespaced Redis keys. Three prefixes prevent collisions:
+
+```
+rl:fw:{scope}:global:{identifier}:{window}       ← fixed window, global tier
+rl:fw:{scope}:route:{routeKey}:{identifier}:{window} ← fixed window, route tier
+rl:sw:{scope}:route:{routeKey}:{identifier}      ← sliding window (no window segment)
+rl:tb:{scope}:route:{routeKey}:{identifier}      ← token bucket (no window segment)
+```
+
+Fixed window keys include a `{window}` segment (e.g. `28693` = `floor(now / windowMs)`)
+so the key naturally rotates at the end of each window without any cleanup.
+
+#### `gateaway/src/limiter/header.js`
+Sets `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `X-RateLimit-Reset`
+on the Express response object. Called after every allowed tier-3 check.
 
 ---
 
-### Algorithm Dispatcher — `runPolicy()`
+### Gateway — Lua Scripts (NEW in feat/atomic-implementation)
 
-`rateLimiter.js` never calls an algorithm directly. It calls `runPolicy()`, which reads
-`policy.algorithm` from `limits.js` and routes to the right implementation:
+#### `gateaway/src/limiter/scripts/slidingWindow.lua`
+Atomic sliding window check-and-consume. Receives: key, now, windowStart, windowMs,
+max, member. Returns: `[allowed, count, remaining, oldestScore, countBefore]`.
 
-```js
-runPolicy({ policy, identifier, routeKey, now })
-  │
-  ├── policy.algorithm === "slidingWindow" → consumeSlidingWindow()
-  ├── policy.algorithm === "tokenBucket"   → consumeTokenBucket()
-  └── default                              → consumeFixedWindow()
-```
+The entire ZREMRANGEBYSCORE → ZCARD → ZADD sequence is one Redis command.
+No other client can observe the state between the check (ZCARD) and the write (ZADD).
 
-To change an algorithm for a route, edit one field in `limits.js`. Nothing else changes.
+#### `gateaway/src/limiter/scripts/tokenBucket.lua`
+Atomic token bucket check-and-consume. Receives: key, now, capacity, refillRate,
+refillIntervalMs, ttlMs. Returns: `[allowed, tokens, msUntilNextToken, capacity]`.
 
----
-
-### Rate Limit Policies (`gateaway/src/config/limits.js`)
-
-| Tier | Scope | Route | Limit | Window | Algorithm |
-|------|-------|-------|-------|--------|-----------|
-| Global | IP | All routes | 300 req | 60s | fixedWindow |
-| Global | User | All routes | 500 req | 60s | fixedWindow |
-| Route | IP | `/auth/login` | 5 req | 60s | slidingWindow |
-| Route | IP | `/auth/register` | 10 req | 60s | slidingWindow |
-| Route | IP | `/api/data/*` | 100 req | 60s | tokenBucket |
-| Route | IP | `/users/*` | 60 req | 60s | fixedWindow |
+The entire HGETALL → refill calculation → HSET sequence is one Redis command.
+Eliminates the double-spend race condition where two gateways both read `tokens=1`
+and both allow the request.
 
 ---
 
-### Response Headers
+### Gateway — Proxy
 
-Set on every response that reaches tier 3 (allowed or blocked):
+#### `gateaway/src/proxy/forwardRequest.js`
+Reverse-proxies allowed requests to the backend using native `fetch`.
 
-| Header | Description |
-|--------|-------------|
-| `X-RateLimit-Limit` | Max requests allowed in the window |
-| `X-RateLimit-Remaining` | Requests left before hitting the limit |
-| `X-RateLimit-Reset` | Unix timestamp (seconds) when the window resets |
-| `Retry-After` | Seconds to wait — only on `429` responses |
-
----
-
-### Fail-Open / Fail-Closed (`REDIS_FAILURE_MODE`)
-
-If Redis becomes unreachable, the gateway checks the `REDIS_FAILURE_MODE` env var:
-
-```
-REDIS_FAILURE_MODE=open    → log warning, call next()   (availability wins)
-REDIS_FAILURE_MODE=closed  → return 503 immediately     (protection wins)
-```
-
-The default is `open`. Set to `closed` in environments where protecting the backend
-matters more than uptime during a Redis outage.
+1. Builds target URL: `BACKEND_URL + req.originalUrl`
+2. Strips **hop-by-hop headers**: `connection`, `keep-alive`, `transfer-encoding`,
+   `upgrade`, `host`, `content-length` (content-length is recalculated by fetch
+   after re-serializing the body — mismatches caused `request aborted` on the backend)
+3. Injects tracing headers: `x-forwarded-for`, `x-forwarded-host`, `x-gateway`
+4. Re-serializes body as `JSON.stringify(req.body)` for POST/PATCH/PUT
+5. Pipes backend's status code, headers, and body back to the client
+6. Returns `502 Bad Gateway` if backend is unreachable
 
 ---
 
-### Observability
+### Gateway — Admin & Observability
 
-#### Structured Logging (`utils/logger.js`)
+#### `gateaway/src/admin/stats.js`
+In-memory counters. Incremented on every rate limit decision by `recordRequest()`.
+Exposed at `GET /admin/gateway-stats`.
 
-One log line per rate limit decision:
-
-```
-[2026-03-10T22:20:01Z] [RateLimit] POST /auth/login ip=1.2.3.4 user=anon scope=ip_route allowed=false ← BLOCKED remaining=0 limit=5
-[2026-03-10T22:20:01Z] [RateLimit] GET  /api/data   ip=1.2.3.4 user=u42  scope=ip_route allowed=true  remaining=87 limit=100
-```
-
-#### In-Memory Stats (`admin/stats.js`)
-
-Counters increment on every rate limit decision. Exposed at `GET /admin/gateway-stats`:
+Also imports `limits.js` and includes a `rules` field in `getStats()` so the
+Dashboard can show the correct algorithm badge per route without a separate API call.
 
 ```json
 {
@@ -348,221 +437,161 @@ Counters increment on every rate limit decision. Exposed at `GET /admin/gateway-
   "allowedRequests": 998,
   "blockedRequests": 44,
   "blockRate": "4.2%",
-  "uptimeSeconds": 3600,
-  "byScope": {
-    "global_ip":   { "allowed": 998, "blocked": 12 },
-    "global_user": { "allowed": 240, "blocked": 8  },
-    "ip_route":    { "allowed": 890, "blocked": 24 }
-  },
-  "byRoute": {
-    "auth_login":    { "allowed": 45,  "blocked": 18 },
-    "auth_register": { "allowed": 12,  "blocked": 3  },
-    "api_data":      { "allowed": 510, "blocked": 20 },
-    "users":         { "allowed": 323, "blocked": 3  },
-    "other":         { "allowed": 108, "blocked": 0  }
-  }
+  "byScope": { "global_ip": {...}, "global_user": {...}, "ip_route": {...} },
+  "byRoute": { "auth_login": {...}, "api_data": {...}, ... },
+  "rules": { "auth_login": { "algorithm": "slidingWindow" }, ... }
 }
 ```
 
+Note: these counters are **per node** and reset on restart. In production you'd
+aggregate stats across nodes into a shared store (Redis or a TSDB).
+
+#### `gateaway/src/utils/logger.js`
+Emits one structured log line per rate limit decision:
+
+```
+[2026-03-12T08:43:00Z] [RateLimit] POST /auth/login ip=127.0.0.1 user=anon scope=ip_route allowed=false ← BLOCKED remaining=0 limit=5
+```
+
+#### `gateaway/src/utils/getClientIp.js`
+Extracts the real client IP from `X-Forwarded-For` header (set by nginx) or falls
+back to `req.ip`. Important when running behind a load balancer — without this,
+every request would appear to come from nginx's internal IP.
+
 ---
 
-## Proxy Forwarding (`gateway/src/proxy/forwardRequest.js`)
+### Backend
 
-When a request passes all rate limit checks, the gateway:
+#### `backend/src/server.js`
+Plain Express app. Mounts auth, data, user, and health routers.
+Knows nothing about rate limiting, Redis, or the gateway.
 
-1. Builds the target URL: `BACKEND_URL + req.originalUrl`
-2. Strips **hop-by-hop headers** (connection, transfer-encoding, etc.)
-3. Injects tracing headers:
-   - `x-forwarded-for` — real client IP
-   - `x-forwarded-host` — original host
-   - `x-gateway` — identifies the gateway
-4. Forwards the method, headers, and body via native Node.js `fetch`
-5. Streams the backend's status code, headers, and JSON body back to the client
-6. Returns `502 Bad Gateway` if the backend is unreachable
+#### `backend/src/data/mockData.js`
+In-memory arrays of users and data records. No database — intentional for a
+learning project so setup is instant.
+
+#### `backend/src/routes/` + `backend/src/controllers/`
+Standard MVC split. Routes define paths, controllers handle logic.
+- `authController` — login (returns fake JWT), register, logout
+- `dataController` — CRUD on data records
+- `usersController` — list, get, patch users
+- `healthController` — returns 200 OK with uptime
 
 ---
 
-## Project File Structure
+## Redis Data Structures — Summary
+
+| Algorithm | Structure | Fields | Cleanup |
+|-----------|-----------|--------|---------|
+| Fixed Window | String (integer) | counter | Auto via TTL |
+| Sliding Window | Sorted Set | score=ms timestamp, member=unique ID | ZREMRANGEBYSCORE on each request + PEXPIRE |
+| Token Bucket | Hash | `tokens`, `lastRefill` | PEXPIRE on each request |
+
+---
+
+## Failure Modes
+
+### Redis goes down
+Controlled by `REDIS_FAILURE_MODE` env var in each gateway container:
+
+```
+open   → log warning, call next() — traffic passes through (availability wins)
+closed → return 503 immediately   — all traffic blocked (protection wins)
+```
+
+Default is `open`. The gateway catches Redis errors in the `catch` block of
+`rateLimiter.js` and checks this env var.
+
+### A gateway node goes down
+Nginx will attempt to route to it and get a connection refused. By default nginx
+marks it as temporarily unavailable and retries the next upstream. Add
+`max_fails=1 fail_timeout=10s` to the upstream config for automatic exclusion.
+
+### Backend goes down
+`forwardRequest.js` catches fetch errors and returns `502 Bad Gateway`.
+The gateway keeps running and rate limiting correctly — it just returns 502
+for all proxied requests until the backend recovers.
+
+---
+
+## Project File Map
 
 ```
 rate-limiting-api/
 │
-├── docker-compose.yml          # Redis service (port 6379)
-├── ARCHITECTURE.md             # This file
-├── README.md                   # Quick start + endpoint reference
-├── .gitignore
+├── docker-compose.yml              6 services: nginx, 3 gateways, redis, backend
+├── nginx.conf                      round-robin upstream + X-Upstream-Addr header
+├── ARCHITECTURE.md                 this file
+├── README.md                       quick start + endpoint reference
 │
-├── gateaway/                   # Public-facing gateway service (port 4000)
-│   ├── package.json
-│   ├── .env                    # PORT, REDIS_URL, BACKEND_URL, REDIS_FAILURE_MODE
+├── gateaway/
+│   ├── Dockerfile                  node:20-alpine — builds the gateway image
+│   ├── .env                        PORT, REDIS_URL, BACKEND_URL, REDIS_FAILURE_MODE
 │   ├── tests/
-│   │   └── rateLimiter.test.js # 10 Vitest tests (all algorithms + tiers)
+│   │   └── rateLimiter.test.js     10 Vitest tests (all algorithms, tiers, failure modes)
 │   └── src/
-│       ├── server.js           # Express app + route wiring + admin endpoints
+│       ├── server.js               Express app, env vars, admin routes, startup log
 │       ├── config/
-│       │   └── limits.js       # All rate limit policies + algorithm selection
+│       │   └── limits.js           ALL rate limit policies — edit here to change anything
 │       ├── limiter/
-│       │   ├── fixedWindow.js  # INCR + PEXPIRE algorithm
-│       │   ├── slidingWindow.js # ZADD/ZREMRANGEBYSCORE/ZCARD algorithm
-│       │   ├── tokenBucket.js  # HGETALL/HSET refill algorithm
-│       │   ├── redisKeys.js    # Namespaced key builders (rl:fw / rl:sw / rl:tb)
-│       │   └── header.js       # X-RateLimit-* header setter
+│       │   ├── scripts/
+│       │   │   ├── slidingWindow.lua   ATOMIC: ZREMRANGEBYSCORE→ZCARD→ZADD in one command
+│       │   │   └── tokenBucket.lua     ATOMIC: HGETALL→refill→HSET in one command
+│       │   ├── fixedWindow.js      INCR + PEXPIRE (atomic by default, no Lua needed)
+│       │   ├── slidingWindow.js    calls redis.slidingWindowConsume Lua command
+│       │   ├── tokenBucket.js      calls redis.tokenBucketConsume Lua command
+│       │   ├── redisKeys.js        key builders: rl:fw / rl:sw / rl:tb namespaces
+│       │   └── header.js           sets X-RateLimit-* headers on the response
 │       ├── middleware/
-│       │   ├── rateLimiter.js  # Three-tier orchestrator + runPolicy() dispatcher
-│       │   └── errorHandler.js # Centralized error → status code mapping
+│       │   ├── rateLimiter.js      3-tier orchestrator + runPolicy() algorithm dispatcher
+│       │   └── errorHandler.js     centralized error → HTTP status mapping
 │       ├── proxy/
-│       │   └── forwardRequest.js  # HTTP proxy to backend (native fetch)
+│       │   └── forwardRequest.js   strips hop-by-hop headers, proxies to backend
 │       ├── redis/
-│       │   └── client.js       # Single shared ioredis connection
+│       │   └── client.js           ioredis connection + defineCommand for Lua scripts
 │       ├── admin/
-│       │   └── stats.js        # In-memory counters: total/blocked/blockRate/byRoute
+│       │   └── stats.js            in-memory counters, live rules snapshot for dashboard
 │       └── utils/
-│           ├── getClientIp.js  # X-Forwarded-For extraction
-│           └── logger.js       # Structured per-decision log line
+│           ├── getClientIp.js      X-Forwarded-For extraction (real IP behind nginx)
+│           └── logger.js           structured log line per rate limit decision
 │
-└── backend/                    # Internal API service (port 5001)
-    ├── package.json
-    ├── .env                    # PORT
+└── backend/
+    ├── Dockerfile                  node:20-alpine — builds the backend image
+    ├── .env                        PORT
     └── src/
-        ├── server.js           # Express app, route mounting
+        ├── server.js               Express app, mounts all routers
         ├── data/
-        │   └── mockData.js     # In-memory users + data records
+        │   └── mockData.js         in-memory users + data records (no database)
         ├── routes/
         │   ├── authRoutes.js
         │   ├── dataRoutes.js
         │   ├── usersRoutes.js
         │   └── healthRoutes.js
         └── controllers/
-            ├── authController.js
-            ├── dataController.js
-            ├── usersController.js
-            └── healthController.js
+            ├── authController.js   login, register, logout
+            ├── dataController.js   CRUD on data records
+            ├── usersController.js  list, get, patch users
+            └── healthController.js returns 200 + uptime
 ```
 
 ---
 
-## Data Flow Examples
+## Key Concepts to Study
 
-### Example A — `POST /auth/login` (sliding window, blocked on 6th attempt)
-
-```
-1. Client sends:
-   POST http://localhost:4000/auth/login
-   Body: { "email": "alice@example.com", "password": "wrong" }
-
-2. Gateway receives request
-   └─ IP: 127.0.0.1  |  userId: null (no x-user-id header)
-   └─ routeKey: "auth_login"
-
-3. Tier 1 — Global IP check (fixedWindow)
-   └─ Key: rl:fw:ip:global:127.0.0.1:28693
-   └─ INCR → 1  (limit: 300)  ✅ allowed
-
-4. Tier 2 — Per-user check
-   └─ Skipped — no x-user-id header
-
-5. Tier 3 — Route check for auth_login (slidingWindow)
-   └─ Key: rl:sw:ip:route:auth_login:127.0.0.1
-   └─ pipeline: ZREMRANGEBYSCORE / ZADD / ZCARD → count: 6  (limit: 5)  ❌ blocked
-
-6. Gateway returns:
-   HTTP 429
-   Retry-After: 54
-   X-RateLimit-Limit: 5
-   X-RateLimit-Remaining: 0
-   X-RateLimit-Reset: 1741600060
-   Body: { "error": "Too Many Requests", "scope": "ip_route",
-           "route": "auth_login", "algorithm": "slidingWindow",
-           "retryAfterSeconds": 54 }
-
-7. Log line emitted:
-   [RateLimit] POST /auth/login ip=127.0.0.1 user=anon scope=ip_route allowed=false ← BLOCKED remaining=0 limit=5
-
-   ← Backend never sees this request
-```
-
----
-
-### Example B — `GET /api/data/42` (token bucket, allowed with burst)
-
-```
-1. Client sends:
-   GET http://localhost:4000/api/data/42
-   Headers: x-user-id: u99
-
-2. Gateway receives request
-   └─ IP: 127.0.0.1  |  userId: "u99"
-   └─ routeKey: "api_data"  (prefix match on /api/data/*)
-
-3. Tier 1 — Global IP check (fixedWindow)
-   └─ Key: rl:fw:ip:global:127.0.0.1:28693
-   └─ INCR → 4  (limit: 300)  ✅ allowed
-
-4. Tier 2 — Per-user check (fixedWindow)
-   └─ Key: rl:fw:user:global:u99:28693
-   └─ INCR → 12  (limit: 500)  ✅ allowed
-
-5. Tier 3 — Route check for api_data (tokenBucket)
-   └─ Key: rl:tb:ip:route:api_data:127.0.0.1
-   └─ HGETALL → { tokens: "87", lastRefill: "1741600000000" }
-   └─ elapsed=5000ms → +10 tokens refilled → tokens=97
-   └─ consume 1 → tokens=96  ✅ allowed
-
-6. Sets response headers:
-   X-RateLimit-Limit: 100
-   X-RateLimit-Remaining: 96
-   X-RateLimit-Reset: 1741600001
-
-7. Proxy forwards to:
-   GET http://localhost:5001/api/data/42
-
-8. Backend returns data record, gateway pipes response back to client
-   Status: 200
-```
-
----
-
-## Technology Choices
-
-| Technology | Role | Why |
-|------------|------|-----|
-| **Node.js 20 + Express 5** | Gateway + Backend runtime | Native `fetch`, async I/O, Express 5 wildcard fix (`/{*path}`) |
-| **ioredis** | Redis client in gateway | Promise-based, supports `pipeline()` for atomic multi-command batches |
-| **Redis 7** | Rate limit state store | Atomic INCR, sorted sets, hashes, built-in TTL, sub-ms ops |
-| **Docker** | Redis container | Isolated, reproducible, no local Redis install needed |
-| **Native `fetch`** | Proxy HTTP calls | Built-in to Node 18+, no extra dependency |
-| **ES Modules** | Module system | Modern JS standard, clean `import`/`export` throughout |
-| **dotenv v17** | Config management | Env vars isolated from code; auto-logs injected values on startup |
-| **Vitest + supertest** | Testing | Fast, ESM-native test runner; supertest for real HTTP assertions |
-
----
-
-## What This System Demonstrates
-
-**Algorithms**
-- **Fixed window** — simple INCR + PEXPIRE, lowest Redis overhead
-- **Sliding window** — rolling sorted set, eliminates boundary burst exploits
-- **Token bucket** — hash-based refill, tolerates bursty legitimate traffic
-- **Algorithm dispatch** — `runPolicy()` selects the right algorithm per route; zero changes needed in `rateLimiter.js` to swap an algorithm
-
-**Gateway patterns**
-- **Three-tier rate limiting** — global IP → per-user → per-route, short-circuit on first failure
-- **Prefix-based route matching** — `/users/1` and `/users/99` share one policy
-- **Per-user limiting** — fair usage enforcement for authenticated traffic via `x-user-id`
-- **Reverse proxy** — transparent forwarding with hop-by-hop header stripping and `x-forwarded-for` injection
-
-**Reliability**
-- **Fail-open / fail-closed** — configurable Redis failure behaviour via `REDIS_FAILURE_MODE` env var
-- **Centralized error handling** — `errorHandler.js` maps all error types to correct HTTP status codes
-- **Admin health endpoint** — `GET /gateway/health` reports Redis reachability and uptime
-
-**Observability**
-- **Structured logging** — one consistent log line per decision with IP, user, scope, result
-- **Live stats** — in-memory counters for total/blocked/blockRate per scope and per route
-- **Admin stats endpoint** — `GET /admin/gateway-stats` exposes the full counter snapshot
-
-**Engineering practices**
-- **Single source of truth** — all policies in `limits.js`; change algorithm or limit in one place
-- **Namespace isolation** — `rl:fw:` / `rl:sw:` / `rl:tb:` prefixes prevent Redis key collisions
-- **10 automated tests** — Vitest + mocked Redis; covers all tiers, both failure modes, prefix matching, all headers
-- **Separation of concerns** — gateway knows nothing about business logic; backend knows nothing about rate limiting
+| Concept | Where to look in this codebase |
+|---------|-------------------------------|
+| Atomic Redis operations | `slidingWindow.lua`, `tokenBucket.lua`, `redis/client.js` |
+| Race condition (the bug Lua fixes) | Comments at top of both `.lua` files |
+| Stateless horizontal scaling | `docker-compose.yml` — 3 identical gateway services |
+| Shared state pattern | All 3 gateways use `REDIS_URL: redis://redis:6379` |
+| Reverse proxy | `proxy/forwardRequest.js` |
+| Hop-by-hop header stripping | `HOP_BY_HOP` set in `forwardRequest.js` |
+| Three-tier middleware | `middleware/rateLimiter.js` — `runPolicy()` function |
+| Strategy pattern | `runPolicy()` dispatches to any algorithm based on config |
+| Fail-open / fail-closed | `rateLimiter.js` catch block + `REDIS_FAILURE_MODE` env var |
+| Redis sorted set | `slidingWindow.lua` — ZADD, ZCARD, ZREMRANGEBYSCORE, ZRANGE |
+| Redis hash | `tokenBucket.lua` — HGETALL, HSET |
+| TTL-based cleanup | Every algorithm calls PEXPIRE — no cron jobs needed |
+| Load balancing | `nginx.conf` — upstream block + round-robin |
+| Docker networking | `docker-compose.yml` — service names as hostnames |
+| Environment-based config | `limits.js` + `.env` — no hardcoded values in logic |
